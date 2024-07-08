@@ -4,13 +4,10 @@
 # Full help here: https://github.com/xnl-h4ck3r/urless/blob/main/README.md
 # Good luck and good hunting! If you really love the tool (or any others), or they helped you find an awesome bounty, consider BUYING ME A COFFEE! (https://ko-fi.com/xnlh4ck3r) ☕ (I could use the caffeine!)
 
-from typing import Pattern
-from pathlib import Path
-import concurrent.futures
-import hashlib
 import re
 import os
 import sys
+from typing import Pattern
 import yaml
 import argparse
 import chardet
@@ -18,6 +15,7 @@ from signal import SIGINT, signal
 from urllib.parse import urlparse
 from termcolor import colored
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     from . import __version__
     import requests
@@ -70,70 +68,25 @@ outFile = None
 linesOrigCount = 0
 linesFinalCount = 0
 
-# Adding global variables for optimized processing
-BATCH_SIZE = 10000  # Number of URLs to process in each batch
-WORKER_COUNT = 4    # Number of parallel workers for multiprocessing
-
-def read_file_in_batches(filename: str):
-    """
-    Generator function to read a file in batches.
-    """
-    with open(filename, 'rb') as f:
-        result = chardet.detect(f.read())  # or readline if the file is large
-        f.seek(0)
-        
-    with open(filename, 'r', encoding=result['encoding']) as f:
-        batch = []
-        for line in f:
-            batch.append(line.strip())
-            if len(batch) >= BATCH_SIZE:
-                yield batch
-                batch = []
-        if batch:
-            yield batch
-
-def process_batch(batch):
-    """
-    Processing a batch of URLs.
-    """
-    local_urlmap = {}
-    for line in batch:
-        processUrl(processLine(line), local_urlmap)
-    return local_urlmap
-
-def merge_urlmaps(main_urlmap, local_urlmap):
-    """
-    Merge a local urlmap into the main urlmap.
-    """
-    for host in local_urlmap:
-        if host not in main_urlmap:
-            main_urlmap[host] = local_urlmap[host]
-        else:
-            for path in local_urlmap[host]:
-                if path not in main_urlmap[host]:
-                    main_urlmap[host][path] = local_urlmap[host][path]
-                else:
-                    main_urlmap[host][path].extend(local_urlmap[host][path])
-
 def verbose():
     '''
     Functions used when printing messages dependant on verbose option
     '''
     return args.verbose
 
-def write(text='',pipe=False):
+def write(text='', pipe=False):
     # Only send text to stdout if the tool isn't piped to pass output to something else, 
     # or if the tool has been piped and the pipe parameter is True
     if sys.stdout.isatty() or (not sys.stdout.isatty() and pipe):
-        sys.stdout.write(text+'\n')
+        sys.stdout.write(text + '\n')
 
 def writerr(text=''):
     # Only send text to stdout if the tool isn't piped to pass output to something else, 
     # or If the tool has been piped to output the send to stderr
     if sys.stdout.isatty():
-        sys.stdout.write(text+'\n')
+        sys.stdout.write(text + '\n')
     else:
-        sys.stderr.write(text+'\n')
+        sys.stderr.write(text + '\n')
 
 def showVersion():
     try:
@@ -147,7 +100,7 @@ def showVersion():
             write('Current urless version '+__version__+' ('+colored('outdated','red')+')\n')
     except:
         pass
-      
+
 def showBanner():
     write('')
     write(colored(r'  __  _ ____  _   ___  ___ ____ ', 'red'))
@@ -164,10 +117,7 @@ def getConfig():
     '''
     global FILTER_EXTENSIONS, FILTER_KEYWORDS, LANGUAGE, REMOVE_PARAMS, reLangPart
     try:
-
-        # Try to get the config file values
-        try:        
-            # Put config in global location based on the OS.
+        try:
             urlessPath = (
                 Path(os.path.join(os.getenv('APPDATA', ''), 'urless')) if os.name == 'nt'
                 else Path(os.path.join(os.path.expanduser("~"), ".config", "urless")) if os.name == 'posix'
@@ -182,7 +132,6 @@ def getConfig():
                 configPath = Path(urlessPath / 'config.yml')
             config = yaml.safe_load(open(configPath))
             
-            # If the user provided the --filter-extensions argument then it overrides the config value
             if args.filter_keywords:
                 FILTER_KEYWORDS = args.filter_keywords
             else:
@@ -194,8 +143,7 @@ def getConfig():
                 except Exception as e:
                     writerr(colored('Unable to read FILTER_EXTENSIONS from config.yml - default set', 'red'))
                     FILTER_KEYWORDS = DEFAULT_FILTER_KEYWORDS
-            
-            # If the user provided the --filter-extensions argument then it overrides the config value
+
             if args.filter_extensions:
                 FILTER_EXTENSIONS = args.filter_extensions
             else:    
@@ -208,9 +156,7 @@ def getConfig():
                     writerr(colored('Unable to read FILTER_EXTENSIONS from config.yml - default set', 'red'))
                     FILTER_EXTENSIONS = DEFAULT_FILTER_EXTENSIONS
             
-            # If the user provided the --language argument then create the regex for language codes
             if args.language:  
-                # Get the language codes
                 try:
                     LANGUAGE = config.get('LANGUAGE')
                     if str(LANGUAGE) == 'None':
@@ -219,13 +165,11 @@ def getConfig():
                 except Exception as e:
                     writerr(colored('Unable to read LANGUAGE from config.yml - default set', 'red'))
                     LANGUAGE = DEFAULT_LANGUAGE
-                # Set the language regex
                 try:
                     reLangPart = re.compile(REGEX_START + '(' + LANGUAGE.replace(',','|') + ')' + REGEX_END)    
                 except Exception as e:
                     writerr(colored('ERROR getConfig 2: ' + str(e), 'red'))
             
-            # If the user provided the --remove-params argument then it overrides the config value
             if args.remove_params:
                 REMOVE_PARAMS = args.remove_params
             else:    
@@ -251,22 +195,14 @@ def getConfig():
         writerr(colored('ERROR getConfig 1: ' + str(e), 'red'))
 
 def handler(signal_received, frame):
-    '''
-    This function is called if Ctrl-C is called by the user
-    An attempt will be made to try and clean up properly
-    '''
     writerr(colored('>>> "Oh my God, they killed Kenny... and urless!" - Kyle', 'red'))
     sys.exit()
                         
 def paramsToDict(params: str) -> list:
-    '''
-    Converts query string to dict
-    '''
     try:
         the_dict = {}
         if params:
             for pair in params.split('&'):
-                # If there is a parameter but no = then add a value of {EMPTY}
                 if pair.find('=') < 0:
                     key = pair+'{EMPTY}'
                     the_dict[key] = '{EMPTY}'
@@ -281,29 +217,17 @@ def paramsToDict(params: str) -> list:
         writerr(colored('ERROR paramsToDict 1: ' + str(e), 'red'))
 
 def dictToParams(params: dict) -> str:
-    '''
-    Converts dict of params to query string
-    '''
     try:
-        # If a parameter has a value of {EMPTY} then just the name will be written and no =
         stringed = [name if value == '{EMPTY}' else name + '=' + value for name, value in params.items()]
-
-        # Only add a ? at the start of parameters, unless the first starts with #
         if list(params.keys())[0][:1] == '#':
             paramString = ''.join(stringed)
         else:
             paramString = '?' + '&'.join(stringed)
-
-        # If a there are any parameters with {EMPTY} in the name then remove the string
         return paramString.replace('{EMPTY}','')
     except Exception as e:
         writerr(colored('ERROR dictToParams 1: ' + str(e), 'red'))
 
 def compareParams(currentParams: list, newParams: dict) -> bool:
-    '''
-    Checks if newParams contain a param
-    that doesn't exist in currentParams
-    '''
     try:
         ogSet = set([])
         for each in currentParams:
@@ -312,16 +236,11 @@ def compareParams(currentParams: list, newParams: dict) -> bool:
         return set(newParams.keys()) - ogSet
     except Exception as e:
         writerr(colored('ERROR compareParams 1: ' + str(e), 'red'))
-        
+
 def isUnwantedContent(path: str) -> bool:
-    '''
-    Checks any potentially unwanted patterns (unless specified otherwise) such as blog/news content
-    '''
     try:
         unwanted = False
-        
         if not args.keep_human_written:
-            # If the path has more than 3 dashes '-' AND isn't a GUID AND (if specified) isn't a Custom ID, then assume it's human written content, e.g. blog
             for part in path.split('/'):
                 if part.count('-') > 3:
                     if str(reCustomIDPart.pattern) == '':
@@ -330,24 +249,17 @@ def isUnwantedContent(path: str) -> bool:
                     else:
                         if not reGuidPart.search(part):
                             unwanted = True
-        
         if not args.keep_yyyymm:
-            # If it contains a year and month in the path then assume like blog/news content, r.g. .../2019/06/...
             if reYYYYMM.search(path):
                 unwanted = True
-            
         return unwanted
     except Exception as e:
         writerr(colored('ERROR isUnwantedContent 1: ' + str(e), 'red'))
 
 def createPattern(path: str) -> str:
-    '''
-    Creates patterns for URLs with integers or GUIDs in them
-    '''
     global patternsGUID, patternsInt, patternsCustomID, patternsLang
     try:
         newParts = []
-
         regexInt = False
         regexGUID = False
         regexCustom = False
@@ -370,8 +282,6 @@ def createPattern(path: str) -> str:
             else:
                 newParts.append(part)
         createdPattern = '/'.join(newParts)
-        
-        # Depending on the type of regex, add the found pattern to the dictionary if it hasn't been added already
         if regexCustom and createdPattern not in patternsCustomID:
             patternsCustomID[createdPattern] = path
         elif regexGUID and createdPattern not in patternsGUID:
@@ -380,15 +290,11 @@ def createPattern(path: str) -> str:
             patternsInt[createdPattern] = path
         elif regexLang and createdPattern not in patternsLang:
             patternsLang[createdPattern] = path
-            
         return createdPattern
     except Exception as e:
         writerr(colored('ERROR createPattern 1: ' + str(e), 'red'))
 
 def patternExists(pattern: str) -> bool:
-    '''
-    Checks if a pattern exists
-    '''
     try:
         for i, seen_pattern in enumerate(patternsSeen):
             if pattern == seen_pattern:
@@ -401,9 +307,6 @@ def patternExists(pattern: str) -> bool:
         writerr(colored('ERROR patternExists 1: ' + str(e), 'red'))
 
 def matchesPatterns(path: str) -> bool:
-    '''
-    Checks if the URL matches any of the regex patterns
-    '''
     try:
         for pattern in patternsSeen:
             if re.search(pattern, re.escape(path)) is not None:
@@ -413,19 +316,13 @@ def matchesPatterns(path: str) -> bool:
         writerr(colored('ERROR matchesPatterns 1: ' + str(e), 'red'))
 
 def hasFilterKeyword(path: str) -> bool:
-    '''
-    Checks if the URL matches the blacklist regex
-    '''
     global FILTER_KEYWORDS
     try:
-        return re.search(FILTER_KEYWORDS.replace(',','|'), path, re.IGNORECASE)
+        return re.search(FILTER_KEYWORDS.replace(',', '|'), path, re.IGNORECASE)
     except Exception as e:
         writerr(colored('ERROR hasFilterKeyword 1: ' + str(e), 'red'))
 
 def hasBadExtension(path: str) -> bool:
-    '''
-    Checks if a URL has a blacklisted extension
-    '''
     global FILTER_EXTENSIONS
     try:
         badExtension = False
@@ -439,12 +336,8 @@ def hasBadExtension(path: str) -> bool:
         writerr(colored('ERROR hasBadExtension 1: ' + str(e), 'red'))
 
 def removeParameters(params) -> dict:
-    '''
-    Removes any parameters from the parameter dictionary
-    '''
     global REMOVE_PARAMS
     try:
-        # For every parameter name in the REMOVE_PARAMS list, remove from the dictionary passed
         for param in REMOVE_PARAMS.split(','):
             if param in params:
                 del params[param]
@@ -452,106 +345,38 @@ def removeParameters(params) -> dict:
     except Exception as e:
         writerr(colored('ERROR removeParameters 1: ' + str(e), 'red'))
 
-
-def processLine(line):
-    # If the -ks / --keep-slash argument was passed, then just add all URLs, 
-    # else remove the trailing slash from any URLs (before any query string)
-    if args.keep_slash:
-        line = line.rstrip('\n')
-    else:
-        if line.find('/?') > 0:
-            line = line.replace('/?', '?', 1)
-        else:
-            line = line.rstrip('\n').rstrip('/')
-
-    # If the -iq / --ignore-querystring argument was passed, remove any querystring and fragment (unless -fnp is passed, in which case the fragment is only removed if a query string exists too)
-    if args.ignore_querystring:
-        if args.fragment_not_param:
-            line = line.split('?')[0]
-        else:
-            line = line.split('?')[0].split('#')[0]
-    return line
-
-
-def processInputOptimized():
-    global urlmap, linesOrigCount
-    try:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=WORKER_COUNT) as executor:
-            futures = []
-
-            if not sys.stdin.isatty():
-                for batch in read_file_in_batches(sys.stdin):
-                    futures.append(executor.submit(process_batch, batch))
-            else:
-                for batch in read_file_in_batches(os.path.expanduser(args.input)):
-                    futures.append(executor.submit(process_batch, batch))
-
-            for future in concurrent.futures.as_completed(futures):
-                local_urlmap = future.result()
-                merge_urlmaps(urlmap, local_urlmap)
-
-    except Exception as e:
-        writerr(colored(f'ERROR processInputOptimized 1: {e}', 'red'))
-
-
 def processUrl(line):
     try:
         parsed = urlparse(line.strip())
-
-        # Set the host
         scheme = parsed.scheme
         if scheme == '':
             host = parsed.netloc
         else:
             host = scheme + '://' + parsed.netloc
-
-        # If the link specifies port 80 or 443, e.g. http://example.com:80, then remove the port
         if str(parsed.port) == '80':
             host = host.replace(':80', '', 1)
         if str(parsed.port) == '443':
             host = host.replace(':443', '', 1)
-
-        # Build the path and parameters
         path, params = parsed.path, paramsToDict(parsed.query)
-
-        # Remove any necessary parameters
         params = removeParameters(params)
-
-        # If there is a fragment...
-        #   if arg -fnp / --fragment-not-param was passed, change the path to include the hash,
-        #   else, add as the last parameter with a name but with value {EMPTY} that doesn't add an = afterwards
         if parsed.fragment:
             if args.fragment_not_param:
                 path = path + '#' + parsed.fragment
             else:
                 params['#' + parsed.fragment] = '{EMPTY}'
-
-        # Add the host to the map if it hasn't already been seen
         if host not in urlmap:
             urlmap[host] = {}
-
-        # If the path has an extension we want to exclude, then just return to continue with the next line
         if hasBadExtension(path):
             return
-
-        # If there are no parameters and path isn't empty
         if not params and path != "":
-            # If its unwanted content or has a keyword to be excluded, then just return to continue with the next line
             if isUnwantedContent(path) or hasFilterKeyword(path):
                 return
-
-            # If the current path already matches a previously saved pattern then just return to continue with the next line
             if matchesPatterns(path):
                 return
-
-        # If the path has ++ in it for any reason, then just output "as is" otherwise it will raise a regex Multiple Repeat Error
         if path.find('++') > 0:
             pattern = path
         else:
-            # Create a pattern for the current path
             pattern = createPattern(path)
-
-        # Update the url map
         if pattern not in urlmap[host]:
             urlmap[host][pattern] = [params] if params else []
         elif params and compareParams(urlmap[host][pattern], params):
@@ -563,33 +388,52 @@ def processUrl(line):
     except Exception as e:
         writerr(colored('ERROR processUrl 1: ' + str(e), 'red'))
 
+def processLine(line):
+    if args.keep_slash:
+        line = line.rstrip('\n')
+    else:
+        if line.find('/?') > 0:
+            line = line.replace('/?', '?', 1)
+        else:
+            line = line.rstrip('\n').rstrip('/')
+    if args.ignore_querystring:
+        if args.fragment_not_param:
+            line = line.split('?')[0]
+        else:
+            line = line.split('?')[0].split('#')[0]
+    return line
+
+def processLineConcurrent(lines):
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(processUrl, processLine(line)): line for line in lines}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                writerr(colored(f'URL caused an exception: {exc}', 'red'))
 
 def processInput():
     global linesOrigCount
-    try:
-        if not sys.stdin.isatty():
-            for line in sys.stdin:
-                processUrl(processLine(line))
-        else:
-            with open(os.path.expanduser(args.input), 'rb') as f:
-                result = chardet.detect(f.read())  # or readline if the file is large
+    url_lines = []
+    if not sys.stdin.isatty():
+        url_lines = sys.stdin.readlines()
+    else:
+        with open(os.path.expanduser(args.input), 'rb') as f:
+            result = chardet.detect(f.read())
+            
+        try:
+            with open(os.path.expanduser(args.input), 'r', encoding=result['encoding']) as inFile:
+                url_lines = inFile.readlines()
+                linesOrigCount = len(url_lines)
+        except Exception as e:
+            writerr(colored(f'ERROR processInput 2: {str(e)}', 'red'))
 
-            try:
-                inFile = open(os.path.expanduser(args.input), 'r', encoding=result['encoding'])
-                lines = inFile.readlines()
-                linesOrigCount = len(lines)
-                for line in lines:
-                    processUrl(processLine(line))
-            except Exception as e:
-                writerr(colored('ERROR processInput 2 ' + str(e), 'red'))
-
-            try:
-                inFile.close()
-            except:
-                pass
-    except Exception as e:
-        writerr(colored('ERROR processInput 1: ' + str(e), 'red'))
-
+    if args.optimized:
+        processLineConcurrent(url_lines)
+    else:
+        for line in url_lines:
+            processed_line = processLine(line)
+            processUrl(processed_line)
 
 def processOutput():
     global linesFinalCount, linesOrigCount, patternsGUID, patternsInt, patternsCustomID, patternsLang
@@ -599,7 +443,7 @@ def processOutput():
             try:
                 outFile = open(os.path.expanduser(args.output), 'w')
             except Exception as e:
-                writerr(colored('ERROR processOutput 2 ' + str(e), 'red'))
+                writerr(colored('ERROR processOutput 2 ' + str(e), 'red'))   
 
         # Output all URLs    
         for host, value in urlmap.items():
@@ -650,7 +494,7 @@ def processOutput():
                             write(host + path, True)
 
         if verbose() and sys.stdin.isatty():
-            writerr(colored('\nInput reduced from ' + str(linesOrigCount) + ' to ' + str(linesFinalCount) + ' lines 🤘', 'cyan'))
+            writerr(colored('\nInput reduced from '+str(linesOrigCount)+' to '+str(linesFinalCount)+' lines 🤘', 'cyan'))
 
         # Close the output file if it was opened
         try:
@@ -664,78 +508,64 @@ def processOutput():
     except Exception as e:
         writerr(colored('ERROR processOutput 1: ' + str(e), 'red'))
 
-
 def showOptionsAndConfig():
     global FILTER_EXTENSIONS, FILTER_KEYWORDS, LANGUAGE, REMOVE_PARAMS
     try:
         write(colored('Selected options and config:', 'cyan'))
-        write(colored('-i: ' + args.input, 'magenta') +
-              colored(' The input file of URLs to de-clutter.', 'white'))
+        write(colored('-i: ' + args.input, 'magenta') + colored(' The input file of URLs to de-clutter.', 'white'))
         if args.output is not None:
-            write(colored('-o: ' + args.output, 'magenta') + 
-                  colored(' The output file that the de-cluttered URL list will be written to.', 'white'))
+            write(colored('-o: ' + args.output, 'magenta') + colored(' The output file that the de-cluttered URL list will be written to.', 'white'))
         else:
-            write(colored('-o: <STDOUT>', 'magenta') +
-                  colored(' An output file wasn\'t given, so output will be written to STDOUT.', 'white'))
+            write(colored('-o: <STDOUT>', 'magenta') + colored(' An output file wasn\'t given, so output will be written to STDOUT.', 'white'))
 
         if args.filter_keywords:
-            write(colored('-fk (Keywords to Filter): ', 'magenta') + colored(args.filter_keywords, 'white'))
+            write(colored('-fk (Keywords to Filter): ', 'magenta') + colored(args.filter_keywords,'white'))
         else:
-            write(colored('Filter Keywords (from Config.yml): ', 'magenta') + colored(FILTER_KEYWORDS, 'white'))
+            write(colored('Filter Keywords (from Config.yml): ', 'magenta') + colored(FILTER_KEYWORDS,'white'))
 
         if args.filter_extensions:
-            write(colored('-fe (Extensions to Filter): ', 'magenta') + colored(args.filter_extensions, 'white'))
+            write(colored('-fe (Extensions to Filter): ', 'magenta') + colored(args.filter_extensions,'white'))
         else:
-            write(colored('Filter Extensions (from Config.yml): ', 'magenta') + colored(FILTER_EXTENSIONS, 'white'))
+            write(colored('Filter Extensions (from Config.yml): ', 'magenta') + colored(FILTER_EXTENSIONS,'white'))
 
         if args.language:
-            write(colored('Languages (from Config.yml): ', 'magenta') + colored(LANGUAGE, 'white'))
-            write(colored('-lang: True', 'magenta') + 
-                  colored('If there are multiple URLs with different language codes as a part of the path, only one version of the URL will be output.', 'white'))
+            write(colored('Languages (from Config.yml): ', 'magenta') + colored(LANGUAGE,'white'))
+            write(colored('-lang: True', 'magenta') + colored('If there are multiple URLs with different language codes as a part of the path, only one version of the URL will be output.', 'white'))
 
         if args.remove_params:
-            write(colored('-rp (Params to Remove): ', 'magenta') + colored(args.remove_params, 'white'))
+            write(colored('-rp (Params to Remove): ', 'magenta') + colored(args.remove_params,'white'))
         else:
-            write(colored('Remove Params (from Config.yml): ', 'magenta') + colored(REMOVE_PARAMS, 'white'))
+            write(colored('Remove Params (from Config.yml): ', 'magenta') + colored(REMOVE_PARAMS,'white'))
 
         if args.keep_slash:
-            write(colored('-ks: True', 'magenta') + 
-                  colored('A trailing slash at the end of a URL in input will not be removed. Therefore there may be identical URLs output, one with and one without a trailing slash.', 'white'))
+            write(colored('-ks: True', 'magenta') + colored('A trailing slash at the end of a URL in input will not be removed. Therefore there may be identical URLs output, one with and one without a trailing slash.','white'))
 
         if args.keep_human_written:
-            write(colored('-khw: True', 'magenta') + 
-                  colored('Prevent URLs with a path part that contains 3 or more dashes (-) from being removed (e.g. blog post)', 'white'))
+            write(colored('-khw: True', 'magenta') + colored('Prevent URLs with a path part that contains 3 or more dashes (-) from being removed (e.g. blog post)', 'white'))
 
         if args.keep_yyyymm:
-            write(colored('-kym: True', 'magenta') + 
-                  colored('Prevent URLs with a path part that contains a year and month in the format `/YYYY/MM` (e.g. blog or news)', 'white'))
+            write(colored('-kym: True', 'magenta') + colored('Prevent URLs with a path part that contains a year and month in the format `/YYYY/DD` (e.g. blog or news)', 'white'))
 
         if args.regex_custom_id:
-            write(colored('-rcid: \'' + str(reCustomIDPart.pattern) + '\'', 'magenta') + 
-                  colored(' USE WITH CAUTION! ', 'red') + 
-                  colored('Regex for a Custom ID that your target uses. Ensure the value is passed in quotes. See the README for more details on this.', 'white'))
+            write(colored('-rcid: \'' + str(reCustomIDPart.pattern) + '\'', 'magenta') + colored(' USE WITH CAUTION! ','red') + colored('Regex for a Custom ID that your target uses. Ensure the value is passed in quotes. See the README for more details on this.', 'white'))
 
         if args.ignore_querystring:
-            write(colored('-iq: True', 'magenta') + 
-                  colored(' Remove the query string (including URL fragments `#`) so output is unique paths only.', 'white'))
+            write(colored('-iq: True', 'magenta') + colored(' Remove the query string (including URL fragments `#`) so output is unique paths only.', 'white'))
 
-        write('')
+        write(colored('', ''))
 
     except Exception as e:
         writerr(colored('ERROR showOptionsAndConfig 1: ' + str(e), 'red'))
 
-
 def argCheckRegexCustomID(value):
     global reCustomIDPart
     try:
-        # If the Custom ID regex was passed, then prefix with ^ and suffix with $ if they are not there already
         if value != '':
             if value[0] != REGEX_START:
                 value = REGEX_START + value
             if value[-1] != REGEX_END:
                 value = value + REGEX_END
 
-        # Try to compile the regex
         reCustomIDPart = re.compile(value)
 
         return value
@@ -744,16 +574,13 @@ def argCheckRegexCustomID(value):
             'Valid regex must be passed.'
         )
 
-
 def main():
     global args, urlmap, patternsSeen, patternsInt, patternsCustomID, patternsGUID, patternsLang
 
-    # Tell Python to run the handler() function when SIGINT is received
     signal(SIGINT, handler)
 
-    # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description='urless - by @Xnl-h4ck3r: De-clutter a list of URLs.'
+        description='urless - by @Xnl-h4ck3r: De-clutter a list of URLs.'    
     )
     parser.add_argument(
         '-i',
@@ -771,14 +598,14 @@ def main():
         '-fk',
         '--filter_keywords',
         action='store',
-        help='A comma separated list of keywords to exclude links (if there no parameters). This will override the FILTER_KEYWORDS list specified in config.yml.',
+        help='A comma separated list of keywords to exclude links (if there no parameters). This will override the FILTER_KEYWORDS list specified in config.yml',
         metavar='<comma separated list>'
     )
     parser.add_argument(
         '-fe',
         '--filter-extensions',
         action='store',
-        help='A comma separated list of file extensions to exclude. This will override the FILTER_EXTENSIONS list specified in config.yml.',
+        help='A comma separated list of file extensions to exclude. This will override the FILTER_EXTENSIONS list specified in config.yml',
         metavar='<comma separated list>'
     )
     parser.add_argument(
@@ -833,38 +660,40 @@ def main():
         action='store_true',
         help='If passed, and there are multiple URLs with different language codes as a part of the path, only one version of the URL will be output. The codes are specified in the "LANGUAGE" section of "config.yml".',
     )
-    parser.add_argument('--optimize', action='store_true', help='Enable optimization for large URL lists.')
-    parser.add_argument('-nb', '--no-banner', action='store_true', help='Hides the tool banner.')
+    parser.add_argument(
+        '-opt',
+        '--optimized',
+        action='store_true',
+        help='Enable optimized processing with concurrency for large input files.',
+    )
+    parser.add_argument("-nb", "--no-banner", action="store_true", help="Hides the tool banner.")
     parser.add_argument('--version', action='store_true', help="Show version number")
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output.')
     args = parser.parse_args()
 
     if args.version:
-        write(colored('urless - v' + __version__), 'cyan')
+        write(colored('urless - v' + __version__, 'cyan'))
         sys.exit()
 
     try:
-        if sys.stdin.isatty() and args.input is None:
-            writerr(colored('You need to provide an input with -i argument or through <stdin>.', 'red'))
-            sys.exit()
+        if sys.stdin.isatty():
+            if args.input is None:
+                writerr(colored('You need to provide an input with -i argument or through <stdin>.', 'red'))
+                sys.exit()
 
         getConfig()
-
+        
         if sys.stdin.isatty():
             if not args.no_banner:
                 showBanner()
             if verbose():
                 showOptionsAndConfig()
 
-        if args.optimize:
-            processInputOptimized()
-        else:
-            processInput()
-
+        processInput()
         processOutput()
 
     except Exception as e:
-        writerr(colored('ERROR main 1: ' + str(e), 'red'))
+        writerr(colored('ERROR main 1: ' + str(e), 'red'))      
 
     try:
         if verbose() and sys.stdin.isatty():
@@ -879,7 +708,6 @@ def main():
         patternsGUID = None
         patternsInt = None
         patternsLang = None
-
 
 if __name__ == '__main__':
     main()
